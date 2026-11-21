@@ -15,6 +15,9 @@ function App() {
   const [analysis, setAnalysis] = useState(null);
   const [biomarkerFilter, setBiomarkerFilter] = useState("all");
   const [isDragging, setIsDragging] = useState(false);
+  const [savedReports, setSavedReports] = useState([]);
+  const [reportsLoading, setReportsLoading] = useState(false);
+  const [activeReportId, setActiveReportId] = useState(null);
 
   const fileInputRef = useRef(null);
 
@@ -73,6 +76,41 @@ function App() {
     }
   };
 
+  const loadSavedReports = async () => {
+    setReportsLoading(true);
+    try {
+      let token = null;
+      if (typeof getToken === "function") {
+        token = await getToken();
+      }
+      const response = await fetch("http://127.0.0.1:5000/reports", {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to load reports (${response.status})`);
+      }
+      const data = await response.json();
+      setSavedReports(data);
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setReportsLoading(false);
+    }
+  };
+
+  const openSavedReport = (report) => {
+    setAnalysis(report.analysis);
+    setActiveReportId(report.id);
+    setBiomarkerFilter("all");
+    setMessage("");
+    document.querySelector(".dashboard-container")?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    loadSavedReports();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleUpload = async () => {
     if (!file) {
       setMessage(t.selectPdfFirst);
@@ -120,6 +158,8 @@ function App() {
       }
 
       setAnalysis(data.analysis);
+      setActiveReportId(data.report_id);
+      loadSavedReports();
       setMessage(t.reportSuccess);
     } catch (error) {
       console.error(error);
@@ -504,6 +544,43 @@ function App() {
               <span>{message}</span>
             </div>
           )}
+        </div>
+      </section>
+
+
+      {/* ========================================================
+          SAVED REPORTS HISTORY
+          ======================================================== */}
+      <section className="saved-reports-container">
+        <div className="card">
+          <div className="card-header">
+            <div className="card-header-titles">
+              <div className="section-tag-pill slate">History</div>
+              <h3>My Saved Reports</h3>
+              <p>Click a report to view its analysis again.</p>
+            </div>
+          </div>
+          <div className="card-body">
+            {reportsLoading && <p>Loading reports...</p>}
+            {!reportsLoading && savedReports.length === 0 && (
+              <p>No saved reports yet. Upload a report to get started.</p>
+            )}
+            {savedReports.map((report) => (
+              <button
+                key={report.id}
+                type="button"
+                className={`saved-report-item ${
+                  activeReportId === report.id ? "saved-report-active" : ""
+                }`}
+                onClick={() => openSavedReport(report)}
+              >
+                <span className="saved-report-name">{report.filename}</span>
+                <span className="saved-report-meta">
+                  {report.report_type} • {new Date(report.created_at).toLocaleString()}
+                </span>
+              </button>
+            ))}
+          </div>
         </div>
       </section>
 
