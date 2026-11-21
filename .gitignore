@@ -51,3 +51,6 @@ tmp/
 # Local backup and test copies
 *_backup.py
 *_tested.py
+
+instance/
+*.db

@@ -1,52 +1,99 @@
-
-from flask import Flask, request, jsonify
+import os
+import logging
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-import os
+from dotenv import load_dotenv
 
+# Load backend secrets explicitly from backend/.env
+backend_env_path = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(backend_env_path)
+
+from auth import require_auth
 from pdf_service import (
     extract_text_from_pdf,
     extract_structured_pdf
 )
-
 from report_classifier import classify_report
 from biomarker_service import analyze_biomarkers
 from analysis_service import analyze_report
 from imaging_service import analyze_imaging_report
 from gemini_ocr_service import extract_pdf_with_gemini
 from translation_service import normalize_language, SUPPORTED_LANGUAGES
+from models import db, Report
 
+# Configure server logger
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("health_interpreter_api")
 
 app = Flask(__name__)
-CORS(app)
 
+# Database: uses DATABASE_URL if set (e.g. PostgreSQL), otherwise local SQLite
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
+    "DATABASE_URL", "sqlite:///health_reports.db"
+)
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
+db.init_app(app)
 
-UPLOAD_FOLDER = "uploads"
+with app.app_context():
+    db.create_all()
+
+# Parse comma-separated authorized origins from CLERK_AUTHORIZED_PARTIES
+raw_azp = os.getenv("CLERK_AUTHORIZED_PARTIES", "http://localhost:5173")
+authorized_origins = [
+    origin.strip() for origin in raw_azp.split(",") if origin.strip()
+] or ["http://localhost:5173"]
+
+# Restrict CORS to authorized frontend origins with explicit headers
+CORS(
+    app,
+    resources={r"/*": {"origins": authorized_origins}},
+    allow_headers=["Authorization", "Content-Type"],
+    methods=["GET", "POST", "OPTIONS"],
+    supports_credentials=True
+)
+
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 ALLOWED_EXTENSIONS = {"pdf"}
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+LANGUAGE_DISPLAY_NAMES = {
+    "en": "English", "hi": "Hindi", "te": "Telugu",
+    "ta": "Tamil", "kn": "Kannada", "ml": "Malayalam",
+    "mr": "Marathi", "bn": "Bengali",
+}
 
 
 def allowed_file(filename):
     return (
         "." in filename
-        and filename.rsplit(".", 1)[1].lower()
-        in ALLOWED_EXTENSIONS
+        and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
     )
 
 
 @app.route("/", methods=["GET"])
 def home():
+    """
+    Public backend health check endpoint.
+    """
     return jsonify({
+        "status": "healthy",
         "message": "AI Health Report Interpreter backend is running"
     })
 
 
 @app.route("/upload", methods=["POST"])
+@require_auth
 def upload_report():
-
+    """
+    Protected PDF upload and clinical analysis endpoint.
+    Requires a valid Clerk session token.
+    """
     if "file" not in request.files:
         return jsonify({"error": "No PDF file was uploaded."}), 400
 
@@ -60,25 +107,20 @@ def upload_report():
 
     filename = secure_filename(file.filename)
 
-    file_path = os.path.join(
-        app.config["UPLOAD_FOLDER"],
-        filename
-    )
+    # Use verified Clerk user ID for isolated storage path when available
+    user_id = getattr(g, "user_id", None)
+    if user_id:
+        user_folder = os.path.join(app.config["UPLOAD_FOLDER"], secure_filename(user_id))
+        os.makedirs(user_folder, exist_ok=True)
+        file_path = os.path.join(user_folder, filename)
+    else:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
 
     file.save(file_path)
 
     try:
-        # Normalize language: accept both ISO codes ("hi") and
-        # legacy full names ("Hindi"). Defaults to "en".
         raw_language = request.form.get("language", "en").strip() or "en"
         lang = normalize_language(raw_language)
-
-        # Map ISO code to English name for Gemini prompt
-        LANGUAGE_DISPLAY_NAMES = {
-            "en": "English", "hi": "Hindi", "te": "Telugu",
-            "ta": "Tamil", "kn": "Kannada", "ml": "Malayalam",
-            "mr": "Marathi", "bn": "Bengali",
-        }
         response_language = LANGUAGE_DISPLAY_NAMES.get(lang, "English")
 
         gemini_extraction = None
@@ -88,20 +130,9 @@ def upload_report():
                 response_language=response_language
             )
         except Exception as error:
-            if hasattr(error, "errors"):
-                error_details = "; ".join(
-                    "{}: {}".format(
-                        ".".join(str(part) for part in item.get("loc", [])),
-                        item.get("msg", "invalid value")
-                    )
-                    for item in error.errors()
-                )
-            else:
-                error_details = str(error)[:500]
-            print(
-                "Gemini OCR failed; using local extraction:",
-                type(error).__name__,
-                error_details
+            logger.warning(
+                "Gemini OCR fallback triggered. Reason: %s",
+                type(error).__name__
             )
 
         if gemini_extraction:
@@ -115,8 +146,8 @@ def upload_report():
                     and len(gemini_extraction["text"]) < 120)
             )
             if has_incomplete_output:
-                print(
-                    "Gemini OCR output was incomplete; using local extraction."
+                logger.info(
+                    "Gemini OCR output incomplete; falling back to local extraction."
                 )
                 gemini_extraction = None
 
@@ -145,13 +176,10 @@ def upload_report():
             else classify_report(extracted_text)
         )
 
-        # Separate analysis paths for laboratory and imaging reports.
         if report_type == "imaging":
             report_analysis = analyze_imaging_report(extracted_text, lang=lang)
-
         else:
             biomarkers = []
-
             if report_type == "laboratory":
                 biomarkers = (
                     gemini_extraction["biomarkers"]
@@ -166,67 +194,75 @@ def upload_report():
         if gemini_extraction and gemini_extraction.get("overall_impression"):
             report_analysis["impression"] = gemini_extraction["overall_impression"]
 
-        # Debug output
-        print("\n" + "=" * 60)
-        print("REPORT")
-        print("=" * 60)
-        print("Filename:", filename)
-        print("OCR SOURCE:", ocr_source)
-        print("REPORT TYPE:", report_type)
-        print("LANGUAGE:", lang)
-        print("TEXT LENGTH:", len(extracted_text))
-        print("STRUCTURED PAGES:", structured_page_count)
-        print("BIOMARKERS FOUND:", len(report_analysis.get("biomarkers", [])))
-        print("IMAGING FINDINGS:", len(report_analysis.get("findings", [])))
-        print("PATTERNS FOUND:", len(report_analysis.get("patterns", [])))
-        print("KNOWLEDGE ITEMS:", len(report_analysis.get("knowledge", [])))
-        print("DOCTOR QUESTIONS:", len(report_analysis.get("doctor_questions", [])))
+        logger.info(
+            "Report processed successfully for user %s | file=%s | ocr=%s | type=%s | lang=%s | biomarkers=%d | findings=%d",
+            user_id or "anonymous",
+            filename,
+            ocr_source,
+            report_type,
+            lang,
+            len(report_analysis.get("biomarkers", [])),
+            len(report_analysis.get("findings", []))
+        )
 
-        for finding in report_analysis.get("findings", []):
-            print(
-                "FINDING:",
-                finding.get("organ"),
-                "|",
-                finding.get("description")
-            )
+        analysis_payload = {
+            "report_type": report_type,
+            "biomarkers": report_analysis.get("biomarkers", []),
+            "findings": report_analysis.get("findings", []),
+            "patterns": report_analysis.get("patterns", []),
+            "impression": report_analysis.get("impression", ""),
+            "concern_level": report_analysis.get("concern_level", {}),
+            "knowledge": report_analysis.get("knowledge", []),
+            "doctor_questions": report_analysis.get("doctor_questions", []),
+        }
 
-        for biomarker in report_analysis.get("biomarkers", []):
-            print(
-                "BIOMARKER:",
-                biomarker.get("name"),
-                "|",
-                biomarker.get("value"),
-                biomarker.get("unit"),
-                "|",
-                biomarker.get("status")
-            )
-
-        print("=" * 60 + "\n")
+        record = Report(
+            user_id=user_id or "anonymous",
+            filename=filename,
+            report_type=report_type,
+            language=lang,
+            ocr_source=ocr_source,
+            analysis=analysis_payload,
+        )
+        db.session.add(record)
+        db.session.commit()
 
         return jsonify({
             "message": "Report processed successfully",
+            "report_id": record.id,
             "filename": filename,
             "status": "document_processed",
             "language": lang,
-            "analysis": {
-                "report_type": report_type,
-                "biomarkers": report_analysis.get("biomarkers", []),
-                "findings": report_analysis.get("findings", []),
-                "patterns": report_analysis.get("patterns", []),
-                "impression": report_analysis.get("impression", ""),
-                "concern_level": report_analysis.get("concern_level", {}),
-                "knowledge": report_analysis.get("knowledge", []),
-                "doctor_questions": report_analysis.get("doctor_questions", [])
-            }
+            "analysis": analysis_payload,
         })
 
     except Exception as error:
-        print("ERROR WHILE PROCESSING REPORT:", error)
-
+        db.session.rollback()
+        logger.error(
+            "Server processing error: %s: %s",
+            type(error).__name__,
+            str(error)
+        )
         return jsonify({
             "error": "An error occurred while processing the medical report.",
-            "details": str(error)
+            "message": "Unable to complete report analysis at this time."
         }), 500
+
+
+@app.route("/reports", methods=["GET"])
+@require_auth
+def list_reports():
+    """
+    Returns the authenticated user's saved reports, newest first.
+    """
+    rows = (
+        Report.query
+        .filter_by(user_id=g.user_id)
+        .order_by(Report.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return jsonify([row.to_dict() for row in rows])
 
 
 if __name__ == "__main__":
